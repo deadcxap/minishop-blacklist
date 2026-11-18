@@ -123,7 +123,7 @@ export class SettingsView implements View {
     this.refreshTimer = setTimeout(() => {
       this.refreshTimer = null;
       void this.pollRefresh();
-    }, this.refreshFeedback ? 4_000 : 1_000);
+    }, this.refreshFeedback ? 10_000 : 3_000);
   }
 
   private async pollRefresh(): Promise<void> {

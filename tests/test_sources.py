@@ -1,4 +1,7 @@
+from unittest.mock import AsyncMock, Mock
+
 import pytest
+from minishop_blacklist import sources
 from minishop_blacklist.settings import (
     DEFAULT_SETTINGS,
     DEFAULT_SOURCES,
@@ -6,6 +9,18 @@ from minishop_blacklist.settings import (
     validate_source_urls,
 )
 from minishop_blacklist.sources import Reason, SourceError, merge_reasons, parse_source
+
+
+@pytest.mark.asyncio
+async def test_identical_download_skips_parsing(monkeypatch) -> None:
+    content = b"42 # example"
+    monkeypatch.setattr(sources, "_download", AsyncMock(return_value=content))
+    snapshot = await sources.fetch_source("https://example.org/list", None)
+    assert snapshot is not None and snapshot.entries == {42: (Reason("example"),)}
+    parse = Mock(side_effect=AssertionError("unchanged source was parsed again"))
+    monkeypatch.setattr(sources, "parse_source", parse)
+    assert await sources.fetch_source("https://example.org/list", snapshot.content_sha256) is None
+    parse.assert_not_called()
 
 
 def test_source_defaults_and_url_deduplication() -> None:

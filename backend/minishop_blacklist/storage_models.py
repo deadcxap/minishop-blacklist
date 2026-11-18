@@ -42,6 +42,8 @@ class Source(Base):
     position: Mapped[int]
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    content_sha256: Mapped[str | None] = mapped_column(String(64))
+    digest_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(String(48))
     count: Mapped[int] = mapped_column(default=0)
     invalid_lines: Mapped[int] = mapped_column(default=0)

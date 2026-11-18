@@ -18,4 +18,4 @@ async def run_refresh_worker(ctx: PluginContext) -> None:
             await refresh_sources(session_factory)
         except Exception:
             logger.error("Blacklist refresh failed before source status could be recorded")
-        await asyncio.sleep(5)
+        await asyncio.sleep(30)

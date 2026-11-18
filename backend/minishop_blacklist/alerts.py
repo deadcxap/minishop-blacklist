@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime
+from typing import cast
 
 from aiogram.exceptions import TelegramAPIError
 from bot.infra import events
+from bot.plugins.capabilities import CORE_PLUGIN_CAPABILITIES
 from bot.plugins.extensions import (
     DurableSubscription,
     ExtensionContributions,
@@ -21,13 +23,16 @@ from bot.plugins.spec import PluginContext
 from db.models import Payment, Subscription, User
 from db.subscription_notification_models import SubscriptionLifecycleNotification
 from pydantic import JsonValue
-from sqlalchemy import exists, or_, select
+from sqlalchemy import Select, exists, literal, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import InstrumentedAttribute
+from sqlalchemy.sql.elements import ColumnElement
 
 from .alert_text import render_alert
-from .settings import EventName, Settings
-from .storage import get_matches, get_settings
+from .settings import EventName
+from .storage import get_matches
+from .storage_models import Configuration, Entry, Source
 
 PLUGIN_ID = "minishop-blacklist"
 _ALERT_JOB = "send-alert"
@@ -87,8 +92,35 @@ def event_job(
     return None
 
 
-def _delivery_chat(settings: Settings, event: EventName) -> int | None:
-    return settings.chat_id if event in settings.events and settings.sources else None
+def _destination(event: EventName) -> Select[tuple[int | None, int | None]]:
+    return select(Configuration.chat_id, Configuration.topic_id).where(
+        Configuration.id == 1,
+        Configuration.chat_id.is_not(None),
+        Configuration.events.contains([event]),
+        exists().select_from(Source),
+    )
+
+
+def _may_need_alert(
+    event: EventName, user_id: int | InstrumentedAttribute[int], telegram_id: int | None = None
+) -> ColumnElement[bool]:
+    account = (
+        select(User.telegram_id)
+        .where(User.user_id == user_id)
+        .correlate_except(User)
+        .scalar_subquery()
+    )
+    tid = literal(telegram_id) if telegram_id is not None else account
+    # Queue an inconclusive event so the worker can retry after registration
+    # commits or a source recovers. A covered miss needs no durable operation.
+    candidate = _destination(event).where(
+        or_(
+            tid.is_(None),
+            exists().where(Entry.telegram_id == tid),
+            exists().where(or_(Source.last_success_at.is_(None), Source.last_error.is_not(None))),
+        )
+    )
+    return candidate.exists()
 
 
 def subscribe_to_events(ctx: PluginContext) -> None:
@@ -104,8 +136,10 @@ def subscribe_to_events(ctx: PluginContext) -> None:
         key, data = candidate
         try:
             async with session_factory.begin() as session:
-                settings = await get_settings(session)
-                if _delivery_chat(settings, event) is None:
+                eligible = _may_need_alert(
+                    event, cast(int, data["user_id"]), _positive_id(data.get("telegram_id"))
+                )
+                if not await session.scalar(select(eligible)):
                     return
                 # Registration can precede commit. Store the ID in the payload to
                 # avoid a foreign-key check against the publishing transaction.
@@ -132,11 +166,15 @@ def subscribe_to_events(ctx: PluginContext) -> None:
             return
         try:
             async with session_factory.begin() as session:
-                settings = await get_settings(session)
-                if _delivery_chat(settings, "payment") is None:
-                    return
-                payment = await session.get(Payment, payment_id)
-                if payment is None or payment.status != "succeeded" or payment.amount <= 0:
+                payment = await session.scalar(
+                    select(Payment).where(
+                        Payment.payment_id == payment_id,
+                        Payment.status == "succeeded",
+                        Payment.amount > 0,
+                        _may_need_alert("payment", Payment.user_id),
+                    )
+                )
+                if payment is None:
                     return
                 await enqueue(
                     session,
@@ -190,10 +228,10 @@ async def _deliver(
         return {"sent": False}
     ctx = operation.runtime
     async with ctx.require_session_factory()() as session:
-        settings = await get_settings(session)
-        chat_id = _delivery_chat(settings, event)
-        if chat_id is None:
+        destination = (await session.execute(_destination(event))).one_or_none()
+        if destination is None:
             return {"sent": False}
+        chat_id, topic_id = destination
         user = await session.get(User, user_id)
         if user is None or not await _action_committed(session, event, user_id, payload):
             raise ExtensionError("blacklist_event_not_committed", 502)
@@ -218,7 +256,7 @@ async def _deliver(
         async with asyncio.timeout(_REQUEST_TIMEOUT):
             result = await bot.send_message(
                 chat_id=chat_id,
-                message_thread_id=settings.topic_id,
+                message_thread_id=topic_id,
                 text=text,
                 parse_mode="HTML",
                 disable_web_page_preview=True,
@@ -255,10 +293,16 @@ async def _send_payment(
 
 
 def alert_contributions() -> ExtensionContributions:
+    if CORE_PLUGIN_CAPABILITIES.get("durable_jobs", 0) >= 2:
+        payment = DurableSubscription(
+            events.PAYMENT_SUCCEEDED, _PAYMENT_JOB, enabled_when=_destination("payment").exists()
+        )
+    else:
+        payment = DurableSubscription(events.PAYMENT_SUCCEEDED, _PAYMENT_JOB)
     return ExtensionContributions(
         jobs=(
             JobHandler(_ALERT_JOB, _send_event),
             JobHandler(_PAYMENT_JOB, _send_payment),
         ),
-        events=(DurableSubscription(events.PAYMENT_SUCCEEDED, _PAYMENT_JOB),),
+        events=(payment,),
     )

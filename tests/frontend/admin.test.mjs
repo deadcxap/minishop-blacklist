@@ -146,7 +146,7 @@ test("manual refresh uses the worker and updates statuses without replacing unsa
   assert.equal(draft.disabled, false);
   draft.value = "6";
   draft.dispatchEvent(event("input"));
-  t.mock.timers.tick(1_000);
+  t.mock.timers.tick(3_000);
   await setImmediate();
 
   assert.equal(statusRequests, 2);

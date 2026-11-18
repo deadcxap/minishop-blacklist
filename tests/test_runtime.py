@@ -11,10 +11,12 @@ import pytest_asyncio
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from bot.app.web.admin_api_impl.auth import admin_auth_middleware
+from bot.app.web.admin_api_impl.users_listing import admin_users_list_route
 from bot.app.web.context import SESSION_FACTORY, SETTINGS
 from bot.app.web.webapp.assets import _csrf_protection_middleware
 from bot.app.web.webapp_auth import create_webapp_session_token
 from bot.infra import events
+from bot.plugins.capabilities import CORE_PLUGIN_CAPABILITIES
 from bot.plugins.extensions.jobs import run_once
 from bot.plugins.loader import register, reset_plugins, run_setup
 from bot.plugins.spec import WEB_SCOPE_WEBAPP, PluginContext
@@ -22,17 +24,20 @@ from bot.services.account_roles import ROLE_ADMIN, grant_role
 from config.settings import Settings as HostSettings
 from db.base import Base
 from db.dal import payment_dal, subscription_dal
+from db.extension_models import ExtensionOperation
 from db.migrator import run_migration_chains
 from db.models import Subscription, User
 from minishop_blacklist import plugin
 from minishop_blacklist.refresh import refresh_sources
 from minishop_blacklist.sources import parse_source
 from minishop_blacklist.storage import claim_due_sources, record_refresh
+from minishop_blacklist.storage_models import Source
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 _BASE = "/api/admin/minishop-blacklist"
 _CUSTOMER_ID = -301
-_TELEGRAM_ID = 998877661
+_TELEGRAM_ID = 5998877661
 _OTHER_TELEGRAM_ID = 898877661
 
 
@@ -106,6 +111,7 @@ async def _client(ctx: PluginContext) -> TestClient:
     app[SETTINGS] = ctx.settings
     app[SESSION_FACTORY] = ctx.require_session_factory()
     plugin.setup_web(ctx, app, scope=WEB_SCOPE_WEBAPP)
+    app.router.add_get("/api/admin/users", admin_users_list_route)
     return TestClient(TestServer(app))
 
 
@@ -180,6 +186,9 @@ async def test_settings_and_statuses_require_admin_and_current_visibility(runtim
         assert matched_page["total"] == 1
         assert matched_page["rows"][0]["telegramId"] == str(_TELEGRAM_ID)
         assert matched_page["rows"][0]["userId"].startswith("ms_")
+        async with ctx.require_session_factory()() as session:
+            accounts = (await session.execute(select(User.telegram_id, User.is_banned))).all()
+            assert set(accounts) == {(2001, False), (_TELEGRAM_ID, False)}
 
         cookie = "rw_webapp_session=" + create_webapp_session_token(ctx.settings, 200)
         settings["display"]["ticket"] = False
@@ -227,7 +236,7 @@ async def test_native_filters_and_manual_refresh(runtime, monkeypatch) -> None:
         result = await client.post(f"{_BASE}/sources/refresh", headers=headers, json={})
         assert (await result.json())["refreshPending"] is True
 
-        async def fetch(_url: str):
+        async def fetch(_url: str, _previous_sha256: str | None):
             return parse_source(f"{_TELEGRAM_ID} # Обновлённый комментарий\n".encode())
 
         monkeypatch.setattr("minishop_blacklist.refresh.fetch_source", fetch)
@@ -238,6 +247,102 @@ async def test_native_filters_and_manual_refresh(runtime, monkeypatch) -> None:
         page = await result.json()
         assert page["total"] == 1
         assert page["rows"][0]["reasons"] == [{"text": "Обновлённый комментарий", "links": []}]
+
+
+@pytest.mark.asyncio
+async def test_native_table_filters_count_and_visibility(runtime) -> None:
+    ctx, _bot = runtime
+    async with await _client(ctx) as client:
+        settings = await _configure(ctx, client)
+        headers = _auth(ctx.settings, 200)
+        route = "/api/admin/users"
+        key = "minishop-blacklist:status"
+        response = await client.get(route, headers=headers)
+        page = await response.json()
+        if not CORE_PLUGIN_CAPABILITIES.get("admin_users_table"):
+            assert "extension_columns" not in page
+            return
+        assert page["extension_columns"][0]["id"] == key
+        assert page["extension_filters"][0]["id"] == key
+        for selected, telegram_id in (("match", _TELEGRAM_ID), ("clear", 2001)):
+            response = await client.get(
+                route,
+                headers=headers,
+                params={
+                    "extension_filter": f"{key}={selected}",
+                    "page_size": 1,
+                },
+            )
+            page = await response.json()
+            assert page["total"] == 1
+            assert page["users"][0]["telegram_id"] == telegram_id
+            assert page["users"][0]["extension_values"][key]
+        async with ctx.require_session_factory().begin() as session:
+            await session.execute(update(Source).values(last_error="source_timeout"))
+        response = await client.get(
+            route, headers=headers, params={"extension_filter": f"{key}=clear"}
+        )
+        assert (await response.json())["total"] == 0
+        response = await client.get(
+            route, headers=headers, params={"extension_filter": f"{key}=match"}
+        )
+        page = await response.json()
+        assert page["total"] == 1
+        assert "копии" in page["users"][0]["extension_values"][key]
+        settings["display"]["users"] = False
+        assert (await client.put(f"{_BASE}/settings", headers=headers, json=settings)).status == 200
+        result = await client.get(
+            route, headers=headers, params={"extension_filter": f"{key}=match"}
+        )
+        page = await result.json()
+        assert page["total"] == 2
+        assert all(row["extension_values"][key] is None for row in page["users"])
+
+
+@pytest.mark.asyncio
+async def test_payment_alert_setting_controls_durable_delivery(runtime) -> None:
+    ctx, bot = runtime
+    sessions = ctx.require_session_factory()
+    headers = _auth(ctx.settings, 200)
+    conditional = CORE_PLUGIN_CAPABILITIES.get("durable_jobs", 0) >= 2
+    async with await _client(ctx) as client:
+        settings = await _configure(ctx, client)
+        for enabled in (False, True, False):
+            settings["events"] = ["payment"] if enabled else []
+            assert (
+                await client.put(f"{_BASE}/settings", headers=headers, json=settings)
+            ).status == 200
+            async with sessions.begin() as session:
+                payment = await payment_dal.create_payment_record(
+                    session,
+                    {
+                        "user_id": _CUSTOMER_ID,
+                        "amount": 10.0,
+                        "currency": "RUB",
+                        "status": "pending",
+                        "provider": "test",
+                        "sale_mode": "subscription",
+                    },
+                )
+                for _ in range(2):
+                    await payment_dal.update_payment_status_by_db_id(
+                        session, payment.payment_id, "succeeded"
+                    )
+            async with sessions() as session:
+                row = await session.get(type(payment), payment.payment_id)
+                assert row is not None and row.status == "succeeded"
+                queued = await session.scalar(
+                    select(func.count())
+                    .select_from(ExtensionOperation)
+                    .where(
+                        ExtensionOperation.state == "queued",
+                        ExtensionOperation.kind == "send-payment-alert",
+                    )
+                )
+                assert queued == int(enabled or not conditional)
+            while await run_once(ctx):
+                pass
+    assert len(bot.sent) == 1
 
 
 @pytest.mark.asyncio
@@ -294,6 +399,10 @@ async def test_four_event_categories_use_target_topic_and_ignore_duplicates(runt
     ):
         await events.emit(event, payload)
         await events.emit(event, payload)
+    await events.emit(events.USER_REGISTERED, {"user_id": 200, "telegram_id": 2001})
+    async with ctx.require_session_factory()() as session:
+        queued = await session.scalar(select(func.count()).select_from(ExtensionOperation))
+        assert queued == 5
     while await run_once(ctx):
         pass
 

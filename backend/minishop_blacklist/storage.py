@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, delete, insert, or_, select, true
+from sqlalchemy import String, and_, bindparam, or_, select, text, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .settings import DisplaySettings, Settings
@@ -40,6 +42,7 @@ class RefreshLease:
     source_id: UUID
     url: str
     token: UUID
+    content_sha256: str | None
 
 
 async def get_settings(session: AsyncSession) -> Settings:
@@ -142,36 +145,35 @@ async def get_matches(session: AsyncSession, telegram_ids: Sequence[int]) -> dic
     }
 
 
-async def claim_due_sources(session: AsyncSession, now: datetime) -> list[RefreshLease]:
-    schedule = (
-        await session.execute(
-            select(Configuration.refresh_hours, Configuration.refresh_requested_at).where(
-                Configuration.id == 1
-            )
-        )
-    ).one_or_none()
-    if schedule is None:
-        raise RuntimeError("blacklist configuration migration is missing")
-    hours, requested_at = schedule
-    cutoff = now - timedelta(hours=hours)
-    due = [Source.last_attempt_at.is_(None), Source.last_attempt_at <= cutoff]
-    if requested_at is not None:
-        due.append(Source.last_attempt_at < requested_at)
+async def claim_due_sources(
+    session: AsyncSession, now: datetime, *, limit: int = 2
+) -> list[RefreshLease]:
     sources = await session.scalars(
         select(Source)
+        .join(Configuration, Configuration.id == 1)
         .where(
-            or_(*due),
+            or_(
+                Source.last_attempt_at.is_(None),
+                Source.last_attempt_at + Configuration.refresh_hours * timedelta(hours=1) <= now,
+                Source.last_attempt_at < Configuration.refresh_requested_at,
+            ),
             or_(Source.lease_until.is_(None), Source.lease_until <= now),
         )
         .order_by(Source.position, Source.id)
-        .with_for_update(skip_locked=True)
+        .limit(limit)
+        .with_for_update(of=Source, skip_locked=True)
     )
     leases = []
     for source in sources:
         token = uuid4()
         source.lease_token = token
         source.lease_until = now + _REFRESH_LEASE
-        leases.append(RefreshLease(source.id, source.url, token))
+        # A rolled-back worker can replace entries and advance last_success_at
+        # without updating the digest. Reconcile that snapshot on the next refresh.
+        digest = (
+            source.content_sha256 if source.digest_verified_at == source.last_success_at else None
+        )
+        leases.append(RefreshLease(source.id, source.url, token, digest))
     return leases
 
 
@@ -203,6 +205,20 @@ async def request_source_refresh(session: AsyncSession) -> None:
         await session.flush()
 
 
+def _encode_entries(snapshot: ParsedSource) -> str:
+    return json.dumps(
+        [
+            {
+                "telegram_id": tid,
+                "reasons": [{"text": reason.text, "links": reason.links} for reason in reasons],
+            }
+            for tid, reasons in snapshot.entries.items()
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
 async def record_refresh(
     session: AsyncSession,
     lease: RefreshLease,
@@ -211,8 +227,8 @@ async def record_refresh(
     snapshot: ParsedSource | None = None,
     error: str | None = None,
 ) -> bool:
-    if (snapshot is None) == (error is None):
-        raise ValueError("a snapshot or an error must be supplied")
+    if snapshot is not None and error is not None:
+        raise ValueError("a snapshot and an error cannot both be supplied")
     source = await session.scalar(
         select(Source)
         .where(Source.id == lease.source_id, Source.lease_token == lease.token)
@@ -220,27 +236,45 @@ async def record_refresh(
     )
     if source is None:
         return False
-    if snapshot is not None:
-        await session.execute(delete(Entry).where(Entry.source_id == source.id))
-        if snapshot.entries:
-            await session.execute(
-                insert(Entry),
-                [
-                    {
-                        "source_id": source.id,
-                        "telegram_id": telegram_id,
-                        "reasons": [
-                            {"text": reason.text, "links": list(reason.links)} for reason in reasons
-                        ],
-                    }
-                    for telegram_id, reasons in snapshot.entries.items()
-                ],
-            )
-        source.last_success_at = now
+    if snapshot is not None and snapshot.content_sha256 != lease.content_sha256:
+        # The fenced source lock serializes writers. One JSONB parameter also
+        # keeps the largest supported snapshot below asyncpg's bind limit.
+        await session.execute(
+            _MERGE_ENTRIES,
+            {
+                "source_id": source.id,
+                "entries": await asyncio.to_thread(_encode_entries, snapshot),
+            },
+        )
+        source.content_sha256 = snapshot.content_sha256
         source.count = len(snapshot.entries)
         source.invalid_lines = snapshot.invalid_lines
+    if error is None:
+        if snapshot is None and lease.content_sha256 is None:
+            raise ValueError("the first successful refresh requires a snapshot")
+        source.last_success_at = now
+        source.digest_verified_at = now
     source.last_attempt_at = now
     source.last_error = error
     source.lease_token = None
     source.lease_until = None
     return True
+
+
+_MERGE_ENTRIES = text("""
+    WITH incoming AS MATERIALIZED (
+        SELECT * FROM jsonb_to_recordset(CAST(:entries AS jsonb))
+            AS item(telegram_id bigint, reasons jsonb)
+    ), removed AS (
+        DELETE FROM ext_minishop_blacklist_entries e
+        WHERE e.source_id = :source_id
+          AND NOT EXISTS (SELECT 1 FROM incoming i WHERE i.telegram_id = e.telegram_id)
+    )
+    INSERT INTO ext_minishop_blacklist_entries (source_id, telegram_id, reasons)
+    SELECT :source_id, i.telegram_id, i.reasons
+    FROM incoming i
+    LEFT JOIN ext_minishop_blacklist_entries e
+      ON e.source_id = :source_id AND e.telegram_id = i.telegram_id
+    WHERE e.telegram_id IS NULL OR e.reasons IS DISTINCT FROM i.reasons
+    ON CONFLICT (source_id, telegram_id) DO UPDATE SET reasons = excluded.reasons
+""").bindparams(bindparam("entries", type_=String))

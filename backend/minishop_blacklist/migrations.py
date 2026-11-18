@@ -101,6 +101,15 @@ def _retire_test_alerts(connection: Connection) -> None:
     )
 
 
+def _add_snapshot_digest(connection: Connection) -> None:
+    connection.execute(
+        text(
+            "ALTER TABLE ext_minishop_blacklist_sources "
+            "ADD COLUMN content_sha256 VARCHAR(64), ADD COLUMN digest_verified_at TIMESTAMPTZ"
+        )
+    )
+
+
 def migrations() -> list[Migration]:
     return [
         Migration(
@@ -118,5 +127,10 @@ def migrations() -> list[Migration]:
             id="minishop-blacklist.0004_retire_test_alerts",
             description="Cancel unfinished jobs from the retired Telegram diagnostics",
             upgrade=_retire_test_alerts,
+        ),
+        Migration(
+            id="minishop-blacklist.0005_snapshot_digest",
+            description="Recognize previously imported source content",
+            upgrade=_add_snapshot_digest,
         ),
     ]

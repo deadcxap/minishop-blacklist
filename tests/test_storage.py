@@ -120,6 +120,49 @@ async def test_source_leases_and_snapshots() -> None:
                 1001: Match("match", (Reason("first"), Reason("second"))),
                 1003: Match("clear"),
             }
+            versions = text(
+                "SELECT source_id, xmin::text FROM ext_minishop_blacklist_entries "
+                "WHERE telegram_id = 1001 ORDER BY source_id"
+            )
+            original_versions = (await session.execute(versions)).all()
+
+        async with sessions.begin() as session:
+            now += timedelta(days=1)
+            again, edited = await claim_due_sources(session, now)
+            assert again.content_sha256 and edited.content_sha256
+            assert await record_refresh(session, again, now)
+            assert await record_refresh(
+                session, edited, now, snapshot=parse_source(b"1001 # first\n1001 # second\n99")
+            )
+            assert (await session.execute(versions)).all() == original_versions
+
+        async with sessions.begin() as session:
+            # A 1.0.0 worker can publish new rows without knowing about the digest.
+            await session.execute(
+                text(
+                    "DELETE FROM ext_minishop_blacklist_entries "
+                    "WHERE source_id = :id AND telegram_id = 1002"
+                ),
+                {"id": first.source_id},
+            )
+            await session.execute(
+                text(
+                    "UPDATE ext_minishop_blacklist_sources "
+                    "SET last_success_at = :time WHERE id = :id"
+                ),
+                {"id": first.source_id, "time": now + timedelta(minutes=1)},
+            )
+            now += timedelta(days=1)
+            restored, unchanged = await claim_due_sources(session, now)
+            assert restored.content_sha256 is None and unchanged.content_sha256
+            assert await record_refresh(
+                session,
+                restored,
+                now,
+                snapshot=parse_source(b"1001 # first\n1002 # other\n500 # no user"),
+            )
+            assert await record_refresh(session, unchanged, now)
+            assert (await get_matches(session, [1002]))[1002].state == "match"
 
         async with sessions.begin() as session:
             one_hour_later = now + timedelta(hours=1)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -40,6 +41,7 @@ class Reason:
 class ParsedSource:
     entries: dict[int, tuple[Reason, ...]]
     invalid_lines: int
+    content_sha256: str
 
 
 class SourceError(ValueError):
@@ -132,7 +134,7 @@ def parse_source(content: bytes) -> ParsedSource:
     entries = {
         telegram_id: merge_reasons([tuple(reasons)]) for telegram_id, reasons in by_id.items()
     }
-    return ParsedSource(entries, invalid_lines)
+    return ParsedSource(entries, invalid_lines, hashlib.sha256(content).hexdigest())
 
 
 async def _download(session: ClientSession, address: str, policy: OutboundPolicy) -> bytes:
@@ -160,7 +162,7 @@ async def _download(session: ClientSession, address: str, policy: OutboundPolicy
     raise SourceError("source_redirect_blocked")
 
 
-async def fetch_source(address: str) -> ParsedSource:
+async def fetch_source(address: str, previous_sha256: str | None) -> ParsedSource | None:
     """Connect only to vetted public addresses, including on each HTTPS redirect."""
     policy = SourceNetworkPolicy()
     connector = TCPConnector(resolver=GuardedResolver(policy), use_dns_cache=False, limit=1)
@@ -176,7 +178,10 @@ async def fetch_source(address: str) -> ParsedSource:
                 auto_decompress=False,
             ) as session,
         ):
-            return parse_source(await _download(session, address, policy))
+            content = await _download(session, address, policy)
+        if previous_sha256 and hashlib.sha256(content).hexdigest() == previous_sha256:
+            return None
+        return await asyncio.to_thread(parse_source, content)
     except TimeoutError as exc:
         raise SourceError("source_timeout") from exc
     except SourceURLValidationError as exc:

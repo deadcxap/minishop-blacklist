@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from aiohttp import web
+from bot.plugins.capabilities import CORE_PLUGIN_CAPABILITIES
 from bot.plugins.extensions import ExtensionContributions
 from bot.plugins.spec import WEB_SCOPE_WEBAPP, Plugin, PluginContext, WorkerTaskSpec
 from db.migrator import Migration
@@ -26,7 +27,14 @@ class BlacklistPlugin(Plugin):
             subscribe_to_events(ctx)
 
     def extensions(self, ctx: PluginContext) -> ExtensionContributions:
-        return alert_contributions()
+        contributions = alert_contributions()
+        if CORE_PLUGIN_CAPABILITIES.get("admin_users_table", 0) >= 1:
+            from .users_table import with_users_table
+
+            return with_users_table(
+                contributions, ctx.settings.DEFAULT_LANGUAGE, self.locales_dir()
+            )
+        return contributions
 
     def migrations(self) -> list[Migration]:
         return migrations()
