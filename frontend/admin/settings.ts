@@ -4,6 +4,7 @@ import { button, element, errorState, errorText, language, root, stateMessage, t
 import type { Props, Translate, View } from "./ui";
 
 const displayLabels = {
+  usersTable: "display_users_table",
   users: "display_users",
   userCard: "display_user_card",
   ticket: "display_ticket",
@@ -147,6 +148,7 @@ export class SettingsView implements View {
   }
 
   private async save(draft: Draft): Promise<void> {
+    const previousUsersTable = this.data?.settings.display.usersTable;
     await this.run("save", async () => {
       const data = await putSettings({
         sources: draft.sources.split(/\r?\n/u).map((value) => value.trim()).filter(Boolean),
@@ -160,6 +162,15 @@ export class SettingsView implements View {
       this.draft = draftFrom(data.settings);
       this.saved = true;
     });
+    if (
+      this.saved &&
+      this.data?.supportsUsersTable &&
+      this.data.settings.display.usersTable !== previousUsersTable &&
+      !this.controller.signal.aborted
+    ) {
+      // Minishop can reuse a cached list when returning to /admin/users.
+      window.location.reload();
+    }
   }
 
   private async run(operation: "load" | "refresh" | "save", action: () => Promise<void>): Promise<void> {
@@ -192,6 +203,7 @@ export class SettingsView implements View {
   private displayControls(draft: Draft, t: Translate): HTMLFieldSetElement {
     const group = checkGroup(t("display"));
     for (const area of AREAS) {
+      if (area === "usersTable" && !this.data?.supportsUsersTable) continue;
       const control = checkbox(area, draft.display[area]);
       control.addEventListener("change", () => { draft.display[area] = control.checked; });
       group.append(checkLabel(t(displayLabels[area]), control));

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 from uuid import UUID, uuid4
@@ -59,6 +59,7 @@ async def get_settings(session: AsyncSession) -> Settings:
             users=configuration.users_visible,
             user_card=configuration.user_card_visible,
             ticket=configuration.ticket_visible,
+            users_table=configuration.users_table_visible,
         ),
         chat_id=configuration.chat_id,
         topic_id=configuration.topic_id,
@@ -66,16 +67,24 @@ async def get_settings(session: AsyncSession) -> Settings:
     )
 
 
-async def save_settings(session: AsyncSession, settings: Settings) -> None:
+async def save_settings(
+    session: AsyncSession, settings: Settings, *, preserve_users_table: bool = False
+) -> Settings:
     configuration = await session.get(
         Configuration, 1, with_for_update=True, populate_existing=True
     )
     if configuration is None:
         raise RuntimeError("blacklist configuration migration is missing")
+    if preserve_users_table:
+        settings = replace(
+            settings,
+            display=replace(settings.display, users_table=configuration.users_table_visible),
+        )
     configuration.refresh_hours = settings.refresh_hours
     configuration.users_visible = settings.display.users
     configuration.user_card_visible = settings.display.user_card
     configuration.ticket_visible = settings.display.ticket
+    configuration.users_table_visible = settings.display.users_table
     configuration.chat_id = settings.chat_id
     configuration.topic_id = settings.topic_id
     configuration.events = list(settings.events)
@@ -90,6 +99,7 @@ async def save_settings(session: AsyncSession, settings: Settings) -> None:
     for source in sources.values():
         await session.delete(source)
     await session.flush()
+    return settings
 
 
 async def list_source_statuses(session: AsyncSession) -> list[SourceStatus]:

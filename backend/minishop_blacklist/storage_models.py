@@ -29,6 +29,7 @@ class Configuration(Base):
     users_visible: Mapped[bool]
     user_card_visible: Mapped[bool]
     ticket_visible: Mapped[bool]
+    users_table_visible: Mapped[bool]
     chat_id: Mapped[int | None] = mapped_column(BigInteger)
     topic_id: Mapped[int | None]
     events: Mapped[list[EventName]] = mapped_column(JSONB)

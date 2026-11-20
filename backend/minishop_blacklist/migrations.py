@@ -101,6 +101,15 @@ def _retire_test_alerts(connection: Connection) -> None:
     )
 
 
+def _add_users_table_visibility(connection: Connection) -> None:
+    connection.execute(
+        text(
+            "ALTER TABLE ext_minishop_blacklist_settings "
+            "ADD COLUMN users_table_visible BOOLEAN NOT NULL DEFAULT TRUE"
+        )
+    )
+
+
 def migrations() -> list[Migration]:
     return [
         Migration(
@@ -118,5 +127,10 @@ def migrations() -> list[Migration]:
             id="minishop-blacklist.0004_retire_test_alerts",
             description="Cancel unfinished jobs from the retired Telegram diagnostics",
             upgrade=_retire_test_alerts,
+        ),
+        Migration(
+            id="minishop-blacklist.0005_users_table_visibility",
+            description="Control the blacklist column and filter in the admin users table",
+            upgrade=_add_users_table_visibility,
         ),
     ]

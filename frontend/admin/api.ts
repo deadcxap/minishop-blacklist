@@ -1,9 +1,9 @@
 export const EVENTS = ["register", "trial", "payment", "expired"] as const;
-export const AREAS = ["users", "userCard", "ticket"] as const;
+export const AREAS = ["usersTable", "users", "userCard", "ticket"] as const;
 
 export type AlertEvent = (typeof EVENTS)[number];
 export type DisplayArea = (typeof AREAS)[number];
-export type DetailArea = Exclude<DisplayArea, "users">;
+export type DetailArea = "userCard" | "ticket";
 
 export interface Settings {
   sources: string[];
@@ -25,6 +25,7 @@ interface SourceStatus {
 
 export interface SettingsData {
   settings: Settings;
+  supportsUsersTable: boolean;
   sourceStatuses: SourceStatus[];
   refreshPending: boolean;
 }
@@ -149,11 +150,13 @@ function decodeSettingsData(payload: Record<string, unknown>): SettingsData {
   const settings = record(payload.settings);
   const display = record(settings.display);
   return {
+    supportsUsersTable: boolean(payload.supportsUsersTable),
     refreshPending: boolean(payload.refreshPending),
     settings: {
       sources: array(settings.sources, string),
       refreshHours: integer(settings.refreshHours),
       display: {
+        usersTable: boolean(display.usersTable),
         users: boolean(display.users),
         userCard: boolean(display.userCard),
         ticket: boolean(display.ticket),

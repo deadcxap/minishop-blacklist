@@ -11,6 +11,7 @@ import pytest_asyncio
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from bot.app.web.admin_api_impl.auth import admin_auth_middleware
+from bot.app.web.admin_api_impl.users_listing import admin_users_list_route
 from bot.app.web.context import SESSION_FACTORY, SETTINGS
 from bot.app.web.webapp.assets import _csrf_protection_middleware
 from bot.app.web.webapp_auth import create_webapp_session_token
@@ -26,9 +27,11 @@ from db.migrator import run_migration_chains
 from db.models import Subscription, User
 from minishop_blacklist import plugin
 from minishop_blacklist.refresh import refresh_sources
+from minishop_blacklist.settings import SUPPORTS_USERS_TABLE
 from minishop_blacklist.sources import parse_source
-from minishop_blacklist.storage import claim_due_sources, record_refresh
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from minishop_blacklist.storage import claim_due_sources, record_refresh, request_source_refresh
+from sqlalchemy import true
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 _BASE = "/api/admin/minishop-blacklist"
 _CUSTOMER_ID = -301
@@ -66,6 +69,7 @@ async def runtime(tmp_path, monkeypatch) -> AsyncIterator[tuple[PluginContext, T
         TELEGRAM_ENABLED=False,
         PLUGINS_ENABLED=True,
         PLUGINS_STRICT=True,
+        ADMIN_USERS_LIST_CACHE_TTL_SECONDS=0,
     )
     monkeypatch.setattr("config.settings._settings_instance", settings)
     bot = Telegram()
@@ -105,6 +109,7 @@ async def _client(ctx: PluginContext) -> TestClient:
     app = web.Application(middlewares=[_csrf_protection_middleware, admin_auth_middleware])
     app[SETTINGS] = ctx.settings
     app[SESSION_FACTORY] = ctx.require_session_factory()
+    app.router.add_get("/api/admin/users", admin_users_list_route)
     plugin.setup_web(ctx, app, scope=WEB_SCOPE_WEBAPP)
     return TestClient(TestServer(app))
 
@@ -115,6 +120,8 @@ async def _configure(ctx: PluginContext, client: TestClient) -> dict[str, object
     body = await response.json()
     assert response.status == 200 and body["settings"]["refreshHours"] == 24
     assert len(body["settings"]["sources"]) == 2
+    assert body["supportsUsersTable"] is SUPPORTS_USERS_TABLE
+    assert body["settings"]["display"]["usersTable"] is True
     settings = body["settings"]
     settings.update(
         refreshHours=48,
@@ -238,6 +245,128 @@ async def test_native_filters_and_manual_refresh(runtime, monkeypatch) -> None:
         page = await result.json()
         assert page["total"] == 1
         assert page["rows"][0]["reasons"] == [{"text": "Обновлённый комментарий", "links": []}]
+
+
+@pytest.mark.skipif(not SUPPORTS_USERS_TABLE, reason="Minishop lacks admin_users_table")
+@pytest.mark.asyncio
+async def test_users_table_status_filter_and_visibility(runtime) -> None:
+    from bot.plugins.extensions import (
+        AdminUserColumn,
+        AdminUserFilter,
+        AdminUserFilterOption,
+        ExtensionContributions,
+    )
+    from bot.plugins.extensions.registry import get_registry
+
+    async def sample_column(_session: AsyncSession, ids: tuple[int, ...]) -> dict[int, str | None]:
+        return dict.fromkeys(ids, "Sample")
+
+    get_registry().register(
+        "example",
+        "1.0.0",
+        ExtensionContributions(
+            admin_user_columns=(AdminUserColumn("status", "Example", sample_column),),
+            admin_user_filters=(
+                AdminUserFilter(
+                    "status", "Example", (AdminUserFilterOption("all", "All"),), lambda _: true()
+                ),
+            ),
+        ),
+    )
+    ctx, _bot = runtime
+    extension = "minishop-blacklist:status"
+    users_path = "/api/admin/users"
+    headers = _auth(ctx.settings, 200)
+    async with await _client(ctx) as client:
+        forbidden = await client.get(users_path, headers=_auth(ctx.settings, _CUSTOMER_ID))
+        assert forbidden.status == 403
+        settings = await _configure(ctx, client)
+        async with ctx.require_session_factory().begin() as session:
+            customer = await session.get(User, _CUSTOMER_ID)
+            customer.first_name = "Native A"
+            session.add_all(
+                [
+                    User(user_id=301, telegram_id=_OTHER_TELEGRAM_ID, first_name="Native B"),
+                    User(user_id=302, telegram_id=80002, first_name="Native Clear"),
+                    User(user_id=303, first_name="Native Unlinked"),
+                ]
+            )
+
+        async def load_users(
+            option: str = "", *, page: int = 0, page_size: int = 25, query: str = "Native"
+        ) -> dict:
+            params = {
+                "q": query,
+                "sort": "name_asc",
+                "page": str(page),
+                "page_size": str(page_size),
+            }
+            if option:
+                params["extension_filter"] = f"{extension}={option}"
+            response = await client.get(users_path, headers=headers, params=params)
+            assert response.status == 200
+            payload = await response.json()
+            assert payload["ok"]
+            return payload
+
+        initial = await load_users()
+        assert initial["total"] == 4
+        assert {row["user_id"]: row["extension_values"][extension] for row in initial["users"]} == {
+            _CUSTOMER_ID: "❌", 301: "❌", 302: "✓", 303: "—",
+        }
+        column = next(item for item in initial["extension_columns"] if item["id"] == extension)
+        assert column["label"] == "Чёрный список"
+        first = await load_users("match", page_size=1)
+        second = await load_users("match", page=1, page_size=1)
+        assert first["total"] == second["total"] == 2
+        assert {first["users"][0]["user_id"], second["users"][0]["user_id"]} == {_CUSTOMER_ID, 301}
+        assert (await load_users("match", query="Native Clear"))["total"] == 0
+        assert [row["user_id"] for row in (await load_users("clear"))["users"]] == [302]
+        assert [row["user_id"] for row in (await load_users("unlinked"))["users"]] == [303]
+        assert (await load_users("unknown"))["total"] == 0
+
+        async with ctx.require_session_factory().begin() as session:
+            admin = await session.get(User, 200)
+            admin.language_code = "en"
+            await request_source_refresh(session)
+            now = datetime.now(UTC)
+            first_source, _ = await claim_due_sources(session, now)
+            await session.flush()
+            assert await record_refresh(session, first_source, now, error="source_timeout")
+
+        unknown = await load_users("unknown")
+        assert [row["user_id"] for row in unknown["users"]] == [302]
+        assert unknown["users"][0]["extension_values"][extension] == "?"
+        english = next(item for item in unknown["extension_filters"] if item["id"] == extension)
+        assert english["label"] == "Blacklist"
+        assert {option["value"]: option["label"] for option in english["options"]} == {
+            "match": "Match found",
+            "clear": "No match",
+            "unknown": "Check incomplete",
+            "unlinked": "No Telegram linked",
+        }
+        assert (await load_users("clear"))["total"] == 0
+        assert (await load_users("match"))["total"] == 2
+
+        settings["display"]["usersTable"] = False
+        assert (await client.put(f"{_BASE}/settings", headers=headers, json=settings)).status == 200
+        settings["display"].pop("usersTable")
+        legacy = await client.put(f"{_BASE}/settings", headers=headers, json=settings)
+        assert (await legacy.json())["settings"]["display"]["usersTable"] is False
+        disabled = await load_users("match")
+        assert disabled["total"] == 4
+        assert disabled["extension_columns"] == [{"id": "example:status", "label": "Example"}]
+        assert [item["id"] for item in disabled["extension_filters"]] == ["example:status"]
+        for row in disabled["users"]:
+            assert row["extension_values"].get(extension) is None
+            assert row["extension_values"]["example:status"] == "Sample"
+
+        settings["display"]["usersTable"] = True
+        settings["sources"] = []
+        assert (await client.put(f"{_BASE}/settings", headers=headers, json=settings)).status == 200
+        assert (await load_users("match"))["total"] == 0
+        assert (await load_users("clear"))["total"] == 0
+        assert (await load_users("unknown"))["total"] == 3
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,7 @@ import { mountView, unmountView, updateView } from "../../frontend/dist/admin/in
 function fixture(t, respond) {
   const window = new Window({ url: "https://minishop.test/shop/admin/blacklist" });
   const globals = {
+    window,
     document: window.document,
     HTMLButtonElement: window.HTMLButtonElement,
     fetch: respond,
@@ -24,14 +25,14 @@ function fixture(t, respond) {
     }
     await window.close();
   });
-  return { target, event: (name) => new window.Event(name, { bubbles: true, cancelable: true }) };
+  return { window, target, event: (name) => new window.Event(name, { bubbles: true, cancelable: true }) };
 }
 
 const source = "https://list.test/blacklist.txt";
 const settings = {
   sources: [source],
   refreshHours: 24,
-  display: { users: true, userCard: true, ticket: true },
+  display: { usersTable: true, users: true, userCard: true, ticket: true },
   chatId: null,
   topicId: null,
   events: [],
@@ -46,10 +47,12 @@ const sourceStatuses = [{
   invalidLines: 2,
 }];
 
+const settingsData = { ok: true, settings, supportsUsersTable: true, sourceStatuses };
+
 test("settings keep the draft through validation failures and save all selected events", async (t) => {
   let submitted;
   let submissions = 0;
-  const { target, event } = fixture(t, async (path, options) => {
+  const { window, target, event } = fixture(t, async (path, options) => {
     assert.equal(path, "/api/admin/minishop-blacklist/settings");
     assert.equal(options.credentials, "same-origin");
     if (options.method === "PUT") {
@@ -58,10 +61,11 @@ test("settings keep the draft through validation failures and save all selected 
       if (++submissions === 1) {
         return Response.json({ ok: false, error: "chat_required" }, { status: 400 });
       }
-      return Response.json({ ok: true, settings: submitted, sourceStatuses, refreshPending: false });
+      return Response.json({ ...settingsData, settings: submitted, refreshPending: false });
     }
-    return Response.json({ ok: true, settings, sourceStatuses, refreshPending: false });
+    return Response.json({ ...settingsData, refreshPending: false });
   });
+  const reload = t.mock.method(window.location, "reload", () => {});
   const translatedKeys = [];
   const instance = mountView("settings", target, {
     at: (key, _values, fallback) => { translatedKeys.push(key); return fallback; },
@@ -70,6 +74,7 @@ test("settings keep the draft through validation failures and save all selected 
 
   assert.ok(translatedKeys.includes("minishop_blacklist_refresh_hours"));
   assert.equal(target.querySelector('[name="refreshHours"]').value, "24");
+  assert.equal(target.querySelector('[name="usersTable"]').checked, true);
   assert.match(target.textContent, /Пропущено некорректных строк — 2/u);
   const interval = target.querySelector('[name="refreshHours"]');
   interval.value = "12";
@@ -82,6 +87,7 @@ test("settings keep the draft through validation failures and save all selected 
   for (const name of ["register", "trial", "payment", "expired"]) {
     assert.equal(target.querySelector(`[name="${name}"]`).checked, true);
   }
+  target.querySelector('[name="usersTable"]').click();
   target.querySelector("form").dispatchEvent(event("submit"));
   await setImmediate();
 
@@ -90,6 +96,8 @@ test("settings keep the draft through validation failures and save all selected 
   assert.match(target.querySelector('[role="alert"]').textContent, /Укажите ID чата/u);
   assert.equal(target.querySelector('[name="refreshHours"]').value, "12");
   assert.equal(target.querySelector('[name="allEvents"]').checked, true);
+  assert.equal(target.querySelector('[name="usersTable"]').checked, false);
+  assert.equal(reload.mock.callCount(), 0);
 
   const chat = target.querySelector('[name="chatId"]');
   chat.value = "-1001234567890";
@@ -107,12 +115,25 @@ test("settings keep the draft through validation failures and save all selected 
     refreshHours: 12,
     chatId: "-1001234567890",
     topicId: "42",
-    display: { users: true, userCard: true, ticket: false },
+    display: { usersTable: false, users: true, userCard: true, ticket: false },
     events: ["register", "trial", "payment", "expired"],
   });
   assert.match(target.textContent, /Настройки сохранены/u);
+  assert.equal(target.querySelector('[name="usersTable"]').checked, false);
+  assert.equal(reload.mock.callCount(), 1);
   unmountView(instance);
   assert.equal(target.childElementCount, 0);
+});
+
+test("hides the users table setting on Minishop without the table extension API", async (t) => {
+  const { target } = fixture(t, async () =>
+    Response.json({ ...settingsData, supportsUsersTable: false, refreshPending: false })
+  );
+  const instance = mountView("settings", target, {});
+  await setImmediate();
+  assert.equal(target.querySelector('[name="usersTable"]'), null);
+  assert.equal(target.querySelector('[name="users"]').checked, true);
+  unmountView(instance);
 });
 
 test("manual refresh uses the worker and updates statuses without replacing unsaved settings", async (t) => {
@@ -124,12 +145,12 @@ test("manual refresh uses the worker and updates statuses without replacing unsa
       assert.equal(path, "/api/admin/minishop-blacklist/sources/refresh");
       assert.equal(options.headers["X-CSRF-Token"], "fixture-token");
       refreshStarted = true;
-      return Response.json({ ok: true, settings, sourceStatuses, refreshPending: true });
+      return Response.json({ ...settingsData, refreshPending: true });
     }
     assert.equal(path, "/api/admin/minishop-blacklist/settings");
     statusRequests += 1;
     const statuses = refreshStarted ? [{ ...sourceStatuses[0], lastError: "source_timeout" }] : sourceStatuses;
-    return Response.json({ ok: true, settings, sourceStatuses: statuses, refreshPending: false });
+    return Response.json({ ...settingsData, sourceStatuses: statuses, refreshPending: false });
   });
 
   const instance = mountView("settings", target, {});

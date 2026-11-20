@@ -15,8 +15,10 @@ from bot.app.web.context import get_settings as get_host_settings
 from .matched_profiles import load_matched_profiles
 from .matches_query import query_matched_users
 from .settings import (
+    DEFAULT_SETTINGS,
     EVENT_NAMES,
     MAX_REFRESH_HOURS,
+    SUPPORTS_USERS_TABLE,
     DisplaySettings,
     Settings,
     SourceURLValidationError,
@@ -71,6 +73,9 @@ def parse_settings(body: dict[str, object]) -> Settings:
         type(display.get(key)) is not bool for key in ("users", "userCard", "ticket")
     ):
         raise InvalidRequest("invalid_display")
+    users_table = display.get("usersTable", DEFAULT_SETTINGS.display.users_table)
+    if type(users_table) is not bool:
+        raise InvalidRequest("invalid_display")
 
     chat_id = _optional_id(
         body.get("chatId"), low=-(2**63), high=_MAX_INT64, error="invalid_chat_id"
@@ -86,7 +91,10 @@ def parse_settings(body: dict[str, object]) -> Settings:
         sources=urls,
         refresh_hours=hours,
         display=DisplaySettings(
-            users=display["users"], user_card=display["userCard"], ticket=display["ticket"]
+            users=display["users"],
+            user_card=display["userCard"],
+            ticket=display["ticket"],
+            users_table=users_table,
         ),
         chat_id=chat_id,
         topic_id=topic_id,
@@ -134,11 +142,13 @@ def _settings_record(
                 "users": settings.display.users,
                 "userCard": settings.display.user_card,
                 "ticket": settings.display.ticket,
+                "usersTable": settings.display.users_table,
             },
             "chatId": str(settings.chat_id) if settings.chat_id is not None else None,
             "topicId": str(settings.topic_id) if settings.topic_id is not None else None,
             "events": settings.events,
         },
+        supportsUsersTable=SUPPORTS_USERS_TABLE,
         refreshPending=refresh_pending,
         sourceStatuses=[
             {
@@ -173,9 +183,12 @@ async def read_settings(request: web.Request) -> web.Response:
 
 @_guard
 async def update_settings(request: web.Request) -> web.Response:
-    settings = parse_settings(await _body(request))
+    body = await _body(request)
+    settings = parse_settings(body)
+    display = body["display"]
+    preserve_users_table = isinstance(display, dict) and "usersTable" not in display
     async with get_session_factory(request)() as session:
-        await save_settings(session, settings)
+        settings = await save_settings(session, settings, preserve_users_table=preserve_users_table)
         refresh_pending = await source_refresh_pending(session)
         statuses = await list_source_statuses(session)
         await session.commit()

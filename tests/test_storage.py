@@ -80,7 +80,7 @@ async def test_source_leases_and_snapshots() -> None:
                 ],
             )
         async with engine.begin() as connection:
-            await connection.run_sync(run_migration_chains, {"minishop-blacklist": chain})
+            await connection.run_sync(run_migration_chains, {"minishop-blacklist": chain[:-1]})
             rows = (await connection.execute(select(operations))).mappings().all()
             assert {row["id"]: row["state"] for row in rows} == dict.fromkeys(
                 retiring, "failed"
@@ -95,6 +95,9 @@ async def test_source_leases_and_snapshots() -> None:
                 )
                 == 1
             )
+
+        async with engine.begin() as connection:
+            await connection.run_sync(run_migration_chains, {"minishop-blacklist": chain})
 
         sessions = async_sessionmaker(engine, expire_on_commit=False)
         async with sessions.begin() as session:

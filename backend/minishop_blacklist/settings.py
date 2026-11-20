@@ -7,12 +7,14 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
 
+from bot.plugins.capabilities import CORE_PLUGIN_CAPABILITIES
 from bot.utils.outbound_network import OutboundPolicy
 from yarl import URL
 
 MAX_SOURCES = 20
 MAX_URL_LENGTH = 2048
 MAX_REFRESH_HOURS = 8760
+SUPPORTS_USERS_TABLE = CORE_PLUGIN_CAPABILITIES.get("admin_users_table", 0) >= 1
 _TRANSLATED_V6 = ipaddress.IPv6Network("64:ff9b::/96"), ipaddress.IPv6Network("64:ff9b:1::/48")
 DEFAULT_SOURCES = (
     "https://raw.githubusercontent.com/Blin4ickUSE/ban-vpn/refs/heads/main/blacklist.txt",
@@ -28,6 +30,7 @@ class DisplaySettings:
     users: bool = True
     user_card: bool = True
     ticket: bool = True
+    users_table: bool = True
 
 
 @dataclass(frozen=True)
