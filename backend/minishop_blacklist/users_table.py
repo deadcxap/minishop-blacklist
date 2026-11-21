@@ -27,7 +27,7 @@ from .storage_models import Configuration, Entry, Source
 
 _ID = "status"
 _EXTENSION_ID = f"{PLUGIN_ID}:{_ID}"
-_ICONS = {"match": "❌", "clear": "✓", "unknown": "?", "unlinked": "—"}
+_ICONS = {"match": "⛔️", "clear": "❎", "unknown": "⏳", "unlinked": "❔"}
 _TITLE = "admin_minishop_blacklist_status"
 _TABLE_VISIBLE: ContextVar[bool] = ContextVar("blacklist_users_table_visible", default=True)
 logger = logging.getLogger(__name__)

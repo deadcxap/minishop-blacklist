@@ -312,7 +312,7 @@ async def test_users_table_status_filter_and_visibility(runtime) -> None:
         initial = await load_users()
         assert initial["total"] == 4
         assert {row["user_id"]: row["extension_values"][extension] for row in initial["users"]} == {
-            _CUSTOMER_ID: "❌", 301: "❌", 302: "✓", 303: "—",
+            _CUSTOMER_ID: "⛔️", 301: "⛔️", 302: "❎", 303: "❔",
         }
         column = next(item for item in initial["extension_columns"] if item["id"] == extension)
         assert column["label"] == "Чёрный список"
@@ -336,7 +336,7 @@ async def test_users_table_status_filter_and_visibility(runtime) -> None:
 
         unknown = await load_users("unknown")
         assert [row["user_id"] for row in unknown["users"]] == [302]
-        assert unknown["users"][0]["extension_values"][extension] == "?"
+        assert unknown["users"][0]["extension_values"][extension] == "⏳"
         english = next(item for item in unknown["extension_filters"] if item["id"] == extension)
         assert english["label"] == "Blacklist"
         assert {option["value"]: option["label"] for option in english["options"]} == {

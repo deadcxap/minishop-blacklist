@@ -14,7 +14,7 @@ from .migrations import migrations
 from .settings import SUPPORTS_USERS_TABLE
 from .worker import run_refresh_worker
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 
 class BlacklistPlugin(Plugin):
